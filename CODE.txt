@@ -1,0 +1,1360 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include "DHT.h"
+
+// ========== WIFI ==========
+const char* ssid = "MATRIX";
+const char* password = "123456789";
+
+// ========== TELEGRAM ==========
+const char* tgToken  = "9247637902:AAE9TXJcJX0U3przsU0LlFrCKm-JdV4se1c";   // get a new one from BotFather (/revoke)
+const char* tgChatId = "7283664397";
+
+const unsigned long ALERT_COOLDOWN = 300000;          // min 5 minutes between alert messages
+unsigned long lastAlertSent = 0;
+bool lastAlertState = false;
+
+// ========== PIN CONNECTIONS ==========
+#define DHT_PIN 27
+#define DHT_TYPE DHT11
+
+#define RAIN_PIN 34
+#define SOIL_PIN 35
+
+#define BUZZER_PIN 25
+#define LED_PIN 26
+
+DHT dht(DHT_PIN, DHT_TYPE);
+WebServer server(80);
+Preferences prefs;
+
+// ========== SOIL CALIBRATION ==========
+int soilDry = 3000;
+int soilWet = 1200;
+
+// ========== RAIN THRESHOLD ==========
+int rainThreshold = 2000;
+
+// ========== ALERT THRESHOLDS (adjustable live from the website) ==========
+int soilAlertLevel = 30;
+int tempLow  = 20;
+int tempHigh = 35;
+int humLow   = 30;
+int humHigh  = 80;
+
+// ========== OUTPUT MODES (set from the website) ==========
+// 0 = AUTO (follows alerts), 1 = ON (always on), 2 = OFF (disabled)
+int ledMode = 0;
+int buzMode = 0;
+
+// ========== TIMING ==========
+const unsigned long SAMPLE_INTERVAL = 10000;     // sensors read every 10 seconds
+const unsigned long WEBSITE_INTERVAL = 20000;    // website refreshes every 20 seconds
+
+const unsigned long BEEP_INTERVAL = 2000;
+const unsigned long BEEP_DURATION = 300;
+
+// ========== SENSOR VALUES ==========
+float temperature = 0;
+float humidity = 0;
+
+int soilRaw = 0;
+int soilPercent = 0;
+int rainRaw = 0;
+
+bool rainDetected = false;
+bool dhtError = false;
+
+bool buzzerOn = false;
+bool ledState = false;
+
+unsigned long lastSample = 0;
+unsigned long lastBeep = 0;
+unsigned long beepStarted = 0;
+unsigned long lastWifiTry = 0;
+
+// ========== HISTORY: LAST 60 READINGS (10 minutes at 10 s) ==========
+const int MAX_HISTORY = 60;
+
+struct Record {
+  float temp;
+  float hum;
+  int soil;
+  int rain;
+};
+
+Record history[MAX_HISTORY];
+
+int historyCount = 0;
+
+// ========== SAVE / LOAD SETTINGS (kept after power off) ==========
+void loadSettings() {
+  prefs.begin("agri", true);
+  soilAlertLevel = prefs.getInt("soilAlert", soilAlertLevel);
+  rainThreshold  = prefs.getInt("rainThr",  rainThreshold);
+  tempLow        = prefs.getInt("tempLow",  tempLow);
+  tempHigh       = prefs.getInt("tempHigh", tempHigh);
+  humLow         = prefs.getInt("humLow",   humLow);
+  humHigh        = prefs.getInt("humHigh",  humHigh);
+  soilDry        = prefs.getInt("soilDry",  soilDry);
+  soilWet        = prefs.getInt("soilWet",  soilWet);
+  ledMode        = prefs.getInt("ledMode",  ledMode);
+  buzMode        = prefs.getInt("buzMode",  buzMode);
+  prefs.end();
+}
+
+void saveSettings() {
+  prefs.begin("agri", false);
+  prefs.putInt("soilAlert", soilAlertLevel);
+  prefs.putInt("rainThr",   rainThreshold);
+  prefs.putInt("tempLow",   tempLow);
+  prefs.putInt("tempHigh",  tempHigh);
+  prefs.putInt("humLow",    humLow);
+  prefs.putInt("humHigh",   humHigh);
+  prefs.putInt("soilDry",   soilDry);
+  prefs.putInt("soilWet",   soilWet);
+  prefs.putInt("ledMode",   ledMode);
+  prefs.putInt("buzMode",   buzMode);
+  prefs.end();
+}
+
+// ========== READ SOIL SENSOR ==========
+int readSoilSensor() {
+  long total = 0;
+  for (int i = 0; i < 10; i++) {
+    total += analogRead(SOIL_PIN);
+    delay(10);
+  }
+  return total / 10;
+}
+
+// ========== CALCULATE VALUES FROM RAW READINGS ==========
+void computeDerived() {
+  if (soilDry != soilWet) {
+    soilPercent = map(soilRaw, soilDry, soilWet, 0, 100);
+  }
+  soilPercent = constrain(soilPercent, 0, 100);
+  rainDetected = (rainRaw < rainThreshold);
+}
+
+// ========== READ ALL SENSORS ==========
+void readSensors() {
+
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+
+  if (isnan(t) || isnan(h)) {
+    dhtError = true;
+  } else {
+    temperature = t;
+    humidity = h;
+    dhtError = false;
+  }
+
+  soilRaw = readSoilSensor();
+  rainRaw = analogRead(RAIN_PIN);
+
+  computeDerived();
+
+  Record r;
+  r.temp = temperature;
+  r.hum = humidity;
+  r.soil = soilPercent;
+  r.rain = rainDetected ? 1 : 0;
+
+  if (historyCount < MAX_HISTORY) {
+    history[historyCount] = r;
+    historyCount++;
+  } else {
+    for (int i = 1; i < MAX_HISTORY; i++) history[i - 1] = history[i];
+    history[MAX_HISTORY - 1] = r;
+  }
+
+  Serial.println();
+  Serial.println("--------------------------------------------");
+
+  if (dhtError) {
+    Serial.println("Temperature: ERROR (check DHT11)");
+    Serial.println("Humidity   : ERROR (check DHT11)");
+  } else {
+    Serial.print("Temperature: "); Serial.print(temperature, 1); Serial.println(" C");
+    Serial.print("Humidity   : "); Serial.print(humidity, 1);    Serial.println(" %");
+  }
+
+  Serial.print("Soil       : "); Serial.print(soilPercent); Serial.println(" %");
+  Serial.print("Rain       : "); Serial.println(rainDetected ? "DETECTED" : "NOT DETECTED");
+  Serial.print("Website    : http://"); Serial.println(WiFi.localIP());
+  Serial.println("--------------------------------------------");
+}
+
+// ========== URL ENCODE (for Telegram text) ==========
+String urlEncode(const String &s) {
+  String out = "";
+  char buf[4];
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      out += c;
+    } else {
+      snprintf(buf, sizeof(buf), "%%%02X", (unsigned char)c);
+      out += buf;
+    }
+  }
+  return out;
+}
+
+// ========== SEND TELEGRAM MESSAGE ==========
+bool sendTelegram(const String &message) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClientSecure client;
+  client.setInsecure();      // skips certificate check (simple, less secure)
+
+  HTTPClient http;
+  String url = "https://api.telegram.org/bot" + String(tgToken) + "/sendMessage";
+
+  http.setTimeout(10000);
+  if (!http.begin(client, url)) return false;
+
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  String body = "chat_id=" + String(tgChatId) + "&text=" + urlEncode(message);
+
+  int code = http.POST(body);
+  Serial.print("Telegram HTTP code: ");
+  Serial.println(code);
+  if (code != 200) Serial.println(http.getString());   // shows the error reason
+
+  http.end();
+  return (code == 200);
+}
+
+// ========== TELEGRAM ALERT CHECK ==========
+void checkTelegramAlert(bool alert) {
+  unsigned long now = millis();
+
+  // send only when an alert STARTS, and respect the cooldown
+  if (alert && !lastAlertState && (lastAlertSent == 0 || now - lastAlertSent >= ALERT_COOLDOWN)) {
+
+    String msg = "ALERT - Smart Agriculture\n";
+    if (rainDetected) msg += "- Rainfall detected\n";
+    if (soilPercent < soilAlertLevel) msg += "- Soil moisture low: " + String(soilPercent) + "%\n";
+    if (!dhtError) {
+      msg += "Temp: " + String(temperature, 1) + " C, Humidity: " + String(humidity, 0) + "%\n";
+    }
+    msg += "Dashboard: http://" + WiFi.localIP().toString();
+
+    if (sendTelegram(msg)) lastAlertSent = now;
+  }
+
+  lastAlertState = alert;
+}
+
+// ========== BUZZER AND LED ==========
+void updateAlerts() {
+
+  bool alert = rainDetected || soilPercent < soilAlertLevel;
+
+  checkTelegramAlert(alert);      // Telegram is NOT affected by LED/Buzzer modes
+
+  // ----- LED: AUTO follows alert, ON always on, OFF always off -----
+  ledState = (ledMode == 1) || (ledMode == 0 && alert);
+  digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+
+  // ----- BUZZER: AUTO follows alert, ON always beeps, OFF silent -----
+  bool buzzerActive = (buzMode == 1) || (buzMode == 0 && alert);
+
+  unsigned long now = millis();
+
+  if (!buzzerActive) {
+    digitalWrite(BUZZER_PIN, LOW);
+    buzzerOn = false;
+    return;
+  }
+
+  if (buzzerOn && now - beepStarted >= BEEP_DURATION) {
+    digitalWrite(BUZZER_PIN, LOW);
+    buzzerOn = false;
+  }
+
+  if (!buzzerOn && now - lastBeep >= BEEP_INTERVAL) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    buzzerOn = true;
+    beepStarted = now;
+    lastBeep = now;
+  }
+}
+
+// ========== JSON DATA FOR WEBSITE ==========
+void sendData() {
+
+  String json;
+  json.reserve(5500);
+
+  json = "{";
+
+  json += "\"temperature\":" + String(temperature, 1) + ",";
+  json += "\"humidity\":" + String(humidity, 1) + ",";
+  json += "\"soil\":" + String(soilPercent) + ",";
+  json += "\"soilRaw\":" + String(soilRaw) + ",";
+  json += "\"rainRaw\":" + String(rainRaw) + ",";
+
+  json += "\"rain\":" + String(rainDetected ? 1 : 0) + ",";
+  json += "\"dhtError\":" + String(dhtError ? 1 : 0) + ",";
+
+  bool alert = rainDetected || soilPercent < soilAlertLevel;
+
+  json += "\"alert\":" + String(alert ? 1 : 0) + ",";
+  json += "\"led\":" + String(ledState ? 1 : 0) + ",";
+  json += "\"buzzer\":" + String(buzzerOn ? 1 : 0) + ",";
+
+  unsigned long elapsed = millis() - lastSample;
+  unsigned long nextIn = (elapsed >= SAMPLE_INTERVAL) ? 0 : (SAMPLE_INTERVAL - elapsed) / 1000;
+
+  json += "\"next\":" + String(nextIn) + ",";
+  json += "\"interval\":" + String(SAMPLE_INTERVAL / 1000) + ",";
+  json += "\"refresh\":" + String(WEBSITE_INTERVAL / 1000) + ",";
+  json += "\"uptime\":" + String(millis() / 1000) + ",";
+  json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+
+  json += "\"cfg\":{";
+  json += "\"tempLow\":" + String(tempLow) + ",";
+  json += "\"tempHigh\":" + String(tempHigh) + ",";
+  json += "\"humLow\":" + String(humLow) + ",";
+  json += "\"humHigh\":" + String(humHigh) + ",";
+  json += "\"soilAlert\":" + String(soilAlertLevel) + ",";
+  json += "\"rainThr\":" + String(rainThreshold) + ",";
+  json += "\"soilDry\":" + String(soilDry) + ",";
+  json += "\"soilWet\":" + String(soilWet) + ",";
+  json += "\"ledMode\":" + String(ledMode) + ",";
+  json += "\"buzMode\":" + String(buzMode);
+  json += "},";
+
+  json += "\"history\":[";
+
+  for (int i = 0; i < historyCount; i++) {
+    if (i > 0) json += ",";
+    json += "{";
+    json += "\"temp\":" + String(history[i].temp, 1) + ",";
+    json += "\"hum\":" + String(history[i].hum, 1) + ",";
+    json += "\"soil\":" + String(history[i].soil) + ",";
+    json += "\"rain\":" + String(history[i].rain);
+    json += "}";
+  }
+
+  json += "]}";
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", json);
+}
+
+// ========== CHANGE THRESHOLDS LIVE ==========
+void handleSet() {
+
+  if (server.hasArg("tempLow"))   tempLow        = constrain(server.arg("tempLow").toInt(), -10, 60);
+  if (server.hasArg("tempHigh"))  tempHigh       = constrain(server.arg("tempHigh").toInt(), -10, 80);
+  if (server.hasArg("humLow"))    humLow         = constrain(server.arg("humLow").toInt(), 0, 100);
+  if (server.hasArg("humHigh"))   humHigh        = constrain(server.arg("humHigh").toInt(), 0, 100);
+  if (server.hasArg("soilAlert")) soilAlertLevel = constrain(server.arg("soilAlert").toInt(), 0, 100);
+  if (server.hasArg("rainThr"))   rainThreshold  = constrain(server.arg("rainThr").toInt(), 0, 4095);
+
+  saveSettings();
+  computeDerived();
+
+  server.send(200, "application/json", "{\"ok\":1}");
+}
+
+// ========== LED / BUZZER MODE FROM THE WEBSITE ==========
+void handleMode() {
+
+  if (server.hasArg("led")) ledMode = constrain(server.arg("led").toInt(), 0, 2);
+  if (server.hasArg("buz")) buzMode = constrain(server.arg("buz").toInt(), 0, 2);
+
+  saveSettings();
+  updateAlerts();     // apply immediately
+
+  server.send(200, "application/json", "{\"ok\":1}");
+}
+
+// ========== SOIL CALIBRATION FROM THE WEBSITE ==========
+void handleCal() {
+
+  String type = server.arg("type");
+
+  int raw = readSoilSensor();
+  soilRaw = raw;
+
+  bool ok = false;
+
+  if (type == "dry" && raw > soilWet + 100) {
+    soilDry = raw;
+    ok = true;
+  } else if (type == "wet" && raw < soilDry - 100) {
+    soilWet = raw;
+    ok = true;
+  }
+
+  if (ok) {
+    saveSettings();
+    computeDerived();
+    server.send(200, "application/json", "{\"ok\":1,\"raw\":" + String(raw) + "}");
+  } else {
+    server.send(400, "application/json", "{\"ok\":0,\"raw\":" + String(raw) + "}");
+  }
+}
+
+// ========== WEBSITE ==========
+const char webpage[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0e1517">
+<title>Smart Agriculture Monitoring</title>
+<style>
+/* ---------- DESIGN TOKENS ---------- */
+:root {
+  --bg:#0e1517; --surface:#151e21; --surface2:#1b262a;
+  --line:#27353a; --line2:#34464c;
+  --text:#e7eeef; --muted:#92a3a8; --faint:#667a80;
+  --accent:#45c4b0; --on-accent:#06201c;
+
+  --temp:#f4a259; --hum:#62b6e8; --soilc:#8ccf7e;
+  --ok:#52c58a; --warn:#e9b44c; --bad:#f06a5f; --cold:#62b6e8;
+
+  --chip-def-bg:#1f2b2f; --chip-def-fg:#92a3a8;
+  --chip-ok-bg:#143325;  --chip-ok-fg:#7fdcab;
+  --chip-warn-bg:#3a2e12; --chip-warn-fg:#f0c874;
+  --chip-bad-bg:#3d1b19; --chip-bad-fg:#f59a92;
+  --chip-cold-bg:#12303f; --chip-cold-fg:#8fcdf0;
+
+  --safe-band:rgba(82,197,138,.22);
+  --shadow:0 1px 2px rgba(0,0,0,.35), 0 8px 24px rgba(0,0,0,.18);
+  --font:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+}
+:root[data-theme="light"] {
+  --bg:#f2f5f3; --surface:#ffffff; --surface2:#f4f7f5;
+  --line:#dfe6e2; --line2:#cdd7d2;
+  --text:#142220; --muted:#586a66; --faint:#8a9a95;
+  --accent:#0f8f7e; --on-accent:#ffffff;
+
+  --temp:#d9730d; --hum:#1f7fc2; --soilc:#3f9a3a;
+  --ok:#1f9d63; --warn:#b97a06; --bad:#d6382c; --cold:#1f7fc2;
+
+  --chip-def-bg:#e8eeea; --chip-def-fg:#586a66;
+  --chip-ok-bg:#dff3e8;  --chip-ok-fg:#14683f;
+  --chip-warn-bg:#fbefd0; --chip-warn-fg:#7a5003;
+  --chip-bad-bg:#fbe0dc; --chip-bad-fg:#a3231a;
+  --chip-cold-bg:#dcecf8; --chip-cold-fg:#14568a;
+
+  --safe-band:rgba(31,157,99,.18);
+  --shadow:0 1px 2px rgba(20,34,32,.06), 0 8px 24px rgba(20,34,32,.06);
+}
+
+* { box-sizing:border-box; }
+html { -webkit-text-size-adjust:100%; }
+body {
+  margin:0; font-family:var(--font); font-size:14px; line-height:1.45;
+  background:var(--bg); color:var(--text); min-height:100vh;
+  transition:background .25s,color .25s;
+}
+button, input { font-family:inherit; }
+button:focus-visible, input:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+
+/* ---------- HEADER ---------- */
+header {
+  position:sticky; top:0; z-index:10;
+  background:var(--bg); border-bottom:1px solid var(--line);
+}
+.bar {
+  max-width:1280px; margin:0 auto; padding:12px 20px;
+  display:flex; align-items:center; justify-content:space-between; gap:12px;
+}
+.brand { display:flex; align-items:center; gap:12px; min-width:0; }
+.logo {
+  width:36px; height:36px; flex:none; border-radius:10px;
+  background:var(--accent); color:var(--on-accent);
+  display:grid; place-items:center;
+}
+.brand h1 { margin:0; font-size:16px; font-weight:650; letter-spacing:-.01em; }
+.brand p  { margin:1px 0 0; font-size:12px; color:var(--muted); }
+.right { display:flex; align-items:center; gap:10px; }
+.conn {
+  display:flex; align-items:center; gap:8px; padding:6px 12px;
+  border-radius:999px; background:var(--surface); border:1px solid var(--line);
+  font-size:13px; white-space:nowrap;
+}
+.dot { width:8px; height:8px; border-radius:50%; background:var(--faint); }
+.dot.on  { background:var(--ok); }
+.dot.off { background:var(--bad); }
+
+/* ---------- BUTTONS ---------- */
+button {
+  font-size:13px; font-weight:600; padding:8px 14px; border-radius:9px; cursor:pointer;
+  color:var(--text); background:var(--surface); border:1px solid var(--line2);
+  transition:background .15s,border-color .15s;
+}
+button:hover { background:var(--surface2); border-color:var(--faint); }
+
+/* ---------- LAYOUT ---------- */
+.container { max-width:1280px; margin:0 auto; padding:16px 20px 8px; }
+
+.sys { display:flex; gap:26px; overflow-x:auto; scrollbar-width:none; padding:2px 0 14px; }
+.sys::-webkit-scrollbar { display:none; }
+.si { flex:none; font-size:12px; color:var(--muted); }
+.si b { display:block; font-size:13px; font-weight:600; color:var(--text); font-variant-numeric:tabular-nums; }
+
+.card {
+  background:var(--surface); border:1px solid var(--line);
+  border-radius:14px; padding:16px 18px; box-shadow:var(--shadow); min-width:0;
+}
+.card h3 { margin:0; font-size:14px; font-weight:650; letter-spacing:-.005em; }
+.sub { margin-top:4px; font-size:12.5px; color:var(--muted); max-width:70ch; }
+
+/* ---------- STATUS BANNER ---------- */
+#banner {
+  display:flex; align-items:center; gap:14px; padding:14px 18px; margin-bottom:14px;
+  background:var(--surface); border:1px solid var(--line); border-left:4px solid var(--ok);
+  border-radius:12px; box-shadow:var(--shadow);
+}
+#banner.alert { border-left-color:var(--bad); }
+#banner.warn  { border-left-color:var(--warn); }
+#bIcon {
+  width:34px; height:34px; flex:none; border-radius:50%;
+  display:grid; place-items:center; font-weight:700; font-size:16px;
+  background:var(--chip-ok-bg); color:var(--chip-ok-fg);
+}
+#banner.alert #bIcon { background:var(--chip-bad-bg); color:var(--chip-bad-fg); animation:beat 1.8s ease-in-out infinite; }
+#banner.warn  #bIcon { background:var(--chip-warn-bg); color:var(--chip-warn-fg); }
+@keyframes beat { 50% { transform:scale(1.12); } }
+#banner b { display:block; font-size:15px; font-weight:650; }
+#banner span { font-size:13px; color:var(--muted); }
+.outs { margin-left:auto; display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
+.out {
+  font-size:12px; font-weight:600; padding:5px 10px; border-radius:8px; white-space:nowrap;
+  background:var(--surface2); border:1px solid var(--line); color:var(--muted);
+}
+.out.on { background:var(--chip-bad-bg); border-color:transparent; color:var(--chip-bad-fg); }
+
+/* ---------- METRIC TILES ---------- */
+.tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:14px; margin-bottom:14px; }
+.tile-head { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+.k { display:flex; align-items:center; gap:8px; font-size:13px; font-weight:600; color:var(--muted); }
+.k::before { content:""; width:9px; height:9px; border-radius:3px; background:var(--c); }
+.big { margin:14px 0 14px; font-size:40px; font-weight:650; letter-spacing:-.025em; line-height:1; font-variant-numeric:tabular-nums; }
+.big small { font-size:16px; font-weight:500; color:var(--muted); margin-left:4px; letter-spacing:0; }
+.big.word { font-size:30px; }
+
+.chip {
+  display:inline-block; padding:3px 10px; border-radius:999px;
+  font-size:12px; font-weight:600; white-space:nowrap;
+  background:var(--chip-def-bg); color:var(--chip-def-fg);
+}
+.chip.ok   { background:var(--chip-ok-bg);   color:var(--chip-ok-fg); }
+.chip.warn { background:var(--chip-warn-bg); color:var(--chip-warn-fg); }
+.chip.bad  { background:var(--chip-bad-bg);  color:var(--chip-bad-fg); }
+.chip.cold { background:var(--chip-cold-bg); color:var(--chip-cold-fg); }
+
+.meter { position:relative; height:8px; border-radius:99px; background:var(--surface2); border:1px solid var(--line); }
+.meter .safe { position:absolute; top:-1px; bottom:-1px; background:var(--safe-band); border-radius:99px; }
+.meter .mark {
+  position:absolute; top:50%; width:16px; height:16px; margin:-8px 0 0 -8px; border-radius:50%;
+  background:var(--text); border:3px solid var(--surface); box-shadow:0 0 0 1px var(--line2);
+  transition:left .5s ease;
+}
+.meter .mark.ok   { background:var(--ok); }
+.meter .mark.warn { background:var(--warn); }
+.meter .mark.bad  { background:var(--bad); }
+.meter .mark.cold { background:var(--cold); }
+.note { margin-top:10px; font-size:12px; color:var(--muted); font-variant-numeric:tabular-nums; }
+
+/* ---------- CHARTS ---------- */
+.charts { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px; margin-bottom:14px; }
+canvas.chart { width:100%; height:220px; display:block; touch-action:pan-y; cursor:crosshair; margin-top:8px; }
+.stats { display:grid; grid-template-columns:repeat(4,1fr); gap:6px; margin-top:10px; }
+.stat { background:var(--surface2); border:1px solid var(--line); border-radius:9px; padding:6px 8px; }
+.stat small { display:block; color:var(--muted); font-size:11px; }
+.stat b { font-size:13px; font-variant-numeric:tabular-nums; }
+
+/* ---------- TABLE ---------- */
+.tablewrap { overflow-x:auto; margin-top:10px; }
+table { width:100%; border-collapse:collapse; font-size:13px; min-width:460px; font-variant-numeric:tabular-nums; }
+th { text-align:left; padding:8px 10px; color:var(--muted); font-size:12px; font-weight:600; border-bottom:1px solid var(--line2); }
+td { padding:8px 10px; border-bottom:1px solid var(--line); }
+tbody tr:first-child td { font-weight:650; }
+tbody tr:last-child td { border-bottom:none; }
+td.r-on  { color:var(--cold); font-weight:600; }
+td.r-off { color:var(--muted); }
+
+/* ---------- OUTPUT SWITCHES ---------- */
+.outctl { display:flex; gap:32px; flex-wrap:wrap; margin-top:14px; }
+.outctl .name { font-size:13px; font-weight:600; margin-bottom:6px; }
+.seg { display:inline-flex; padding:3px; gap:2px; border-radius:11px; background:var(--surface2); border:1px solid var(--line); }
+.seg button { border:none; background:transparent; padding:7px 18px; border-radius:8px; color:var(--muted); }
+.seg button:hover { background:transparent; color:var(--text); }
+.seg button.active { background:var(--accent); color:var(--on-accent); }
+.seg button.active.off { background:var(--bad); color:#fff; }
+
+/* ---------- SETTINGS ---------- */
+.groups { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:14px; margin-top:14px; }
+.grp { background:var(--surface2); border:1px solid var(--line); border-radius:12px; padding:14px 16px; }
+.grp h4 { margin:0 0 12px; font-size:13px; font-weight:650; }
+.row + .row { margin-top:14px; }
+.row label { display:flex; justify-content:space-between; font-size:13px; color:var(--muted); margin-bottom:8px; }
+.row label em { font-style:normal; font-weight:650; color:var(--text); font-variant-numeric:tabular-nums; }
+.u-c::after   { content:"\00B0C"; }
+.u-pct::after { content:"%"; }
+input[type=range] { -webkit-appearance:none; appearance:none; width:100%; height:6px; border-radius:6px; background:var(--line2); outline:none; }
+input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; appearance:none; width:20px; height:20px; border-radius:50%; background:var(--accent); border:3px solid var(--surface2); box-shadow:0 0 0 1px var(--line2); cursor:pointer; }
+input[type=range]::-moz-range-thumb { width:16px; height:16px; border-radius:50%; background:var(--accent); border:3px solid var(--surface2); cursor:pointer; }
+.btns { display:flex; gap:8px; flex-wrap:wrap; margin-top:16px; }
+.hint { margin-top:8px; font-size:12px; color:var(--faint); }
+
+/* ---------- TOAST + FOOTER ---------- */
+#toast {
+  position:fixed; left:50%; bottom:24px; transform:translate(-50%,90px);
+  background:var(--text); color:var(--bg);
+  padding:10px 18px; border-radius:10px; font-size:13px; font-weight:600;
+  transition:transform .25s; z-index:50; max-width:90vw;
+}
+#toast.show { transform:translate(-50%,0); }
+footer { max-width:1280px; margin:0 auto; padding:10px 20px 28px; color:var(--faint); font-size:12px; }
+
+/* ---------- RESPONSIVE ---------- */
+@media (max-width:1000px) { .charts { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+@media (max-width:680px) {
+  .charts { grid-template-columns:1fr; }
+  .brand p { display:none; }
+  .bar { padding:10px 14px; }
+  .container { padding:12px 14px 6px; }
+  #banner { flex-wrap:wrap; }
+  .outs { margin-left:0; width:100%; justify-content:flex-start; }
+  .big { font-size:36px; }
+}
+@media (prefers-reduced-motion:reduce) {
+  * { animation:none !important; transition:none !important; }
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="bar">
+    <div class="brand">
+      <div class="logo">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 20A7 7 0 0 1 9.8 6.1C15.5 5 17 4.5 19 2c1 2 2 4.2 2 8 0 5.5-4.8 10-10 10z"/><path d="M2 21c0-3 1.9-5.4 5-6.5"/></svg>
+      </div>
+      <div>
+        <h1>Smart Agriculture Monitor</h1>
+        <p>Live field sensors from your ESP32</p>
+      </div>
+    </div>
+    <div class="right">
+      <button id="themeBtn" onclick="toggleTheme()">Light</button>
+      <div class="conn"><span class="dot" id="dot"></span><span id="connection">Connecting...</span></div>
+    </div>
+  </div>
+</header>
+
+<div class="container">
+
+  <div class="sys">
+    <div class="si">Last update<b id="time">--</b></div>
+    <div class="si">Next reading<b id="next">--</b></div>
+    <div class="si">Readings stored<b id="count">0</b></div>
+    <div class="si">WiFi signal<b id="rssi">--</b></div>
+    <div class="si">Uptime<b id="uptime">--</b></div>
+    <div class="si">Sensor interval<b id="ivText">--</b></div>
+    <div class="si">Page refresh<b id="rfText">--</b></div>
+  </div>
+
+  <div id="banner">
+    <div id="bIcon">&#10003;</div>
+    <div>
+      <b id="bTitle">Connecting to ESP32...</b>
+      <span id="bText">Waiting for the first reading</span>
+    </div>
+    <div class="outs">
+      <div class="out" id="ledOut">LED off</div>
+      <div class="out" id="buzOut">Buzzer off</div>
+    </div>
+  </div>
+
+  <div class="tiles">
+    <div class="card">
+      <div class="tile-head"><span class="k" style="--c:var(--temp)">Air temperature</span><span class="chip" id="tempStatus">Waiting</span></div>
+      <div class="big"><span id="tempVal">--</span><small>&deg;C</small></div>
+      <div class="meter"><i class="safe" id="tempSafe"></i><i class="mark" id="tempMark"></i></div>
+      <div class="note" id="tempNote">&nbsp;</div>
+    </div>
+    <div class="card">
+      <div class="tile-head"><span class="k" style="--c:var(--hum)">Air humidity</span><span class="chip" id="humStatus">Waiting</span></div>
+      <div class="big"><span id="humVal">--</span><small>%</small></div>
+      <div class="meter"><i class="safe" id="humSafe"></i><i class="mark" id="humMark"></i></div>
+      <div class="note" id="humNote">&nbsp;</div>
+    </div>
+    <div class="card">
+      <div class="tile-head"><span class="k" style="--c:var(--soilc)">Soil moisture</span><span class="chip" id="soilStatus">Waiting</span></div>
+      <div class="big"><span id="soilVal">--</span><small>%</small></div>
+      <div class="meter"><i class="safe" id="soilSafe"></i><i class="mark" id="soilMark"></i></div>
+      <div class="note" id="soilNote">&nbsp;</div>
+    </div>
+    <div class="card">
+      <div class="tile-head"><span class="k" style="--c:var(--cold)">Rainfall</span><span class="chip" id="rainStatus">Waiting</span></div>
+      <div class="big word" id="rainText">--</div>
+      <div class="meter"><i class="safe" id="rainSafe"></i><i class="mark" id="rainMark"></i></div>
+      <div class="note" id="rainNote">&nbsp;</div>
+    </div>
+  </div>
+
+  <div class="charts">
+    <div class="card">
+      <h3>Temperature</h3>
+      <canvas class="chart" id="tempChart"></canvas>
+      <div class="stats" id="tempStats"></div>
+    </div>
+    <div class="card">
+      <h3>Humidity</h3>
+      <canvas class="chart" id="humChart"></canvas>
+      <div class="stats" id="humStats"></div>
+    </div>
+    <div class="card">
+      <h3>Soil moisture</h3>
+      <canvas class="chart" id="soilChart"></canvas>
+      <div class="stats" id="soilStats"></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:14px">
+    <h3>Last minute</h3>
+    <div class="sub" id="recentInfo">Waiting for data...</div>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Time</th><th>Temperature</th><th>Humidity</th><th>Soil</th><th>Rain</th></tr></thead>
+        <tbody id="recentBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:14px">
+    <h3>LED and buzzer</h3>
+    <div class="sub">Auto switches them on only during an alert. On keeps them running (the buzzer beeps). Off disables them, even during an alert. Telegram alerts are not affected.</div>
+    <div class="outctl">
+      <div>
+        <div class="name">LED</div>
+        <div class="seg" id="ledSeg">
+          <button data-v="0">Auto</button><button data-v="1">On</button><button data-v="2">Off</button>
+        </div>
+      </div>
+      <div>
+        <div class="name">Buzzer</div>
+        <div class="seg" id="buzSeg">
+          <button data-v="0">Auto</button><button data-v="1">On</button><button data-v="2">Off</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:14px">
+    <h3>Alert limits and calibration</h3>
+    <div class="sub">Changes apply on the ESP32 straight away and are kept after a power cut. Rain or soil below its limit triggers the LED and buzzer when they are set to Auto.</div>
+    <div class="groups">
+      <div class="grp">
+        <h4>Temperature</h4>
+        <div class="row"><label>Too cold below <em class="u-c" id="vTempLow">20</em></label><input type="range" id="tempLow" min="-10" max="50" step="1"></div>
+        <div class="row"><label>Too hot above <em class="u-c" id="vTempHigh">35</em></label><input type="range" id="tempHigh" min="0" max="60" step="1"></div>
+      </div>
+      <div class="grp">
+        <h4>Humidity</h4>
+        <div class="row"><label>Too dry below <em class="u-pct" id="vHumLow">30</em></label><input type="range" id="humLow" min="0" max="100" step="1"></div>
+        <div class="row"><label>Too humid above <em class="u-pct" id="vHumHigh">80</em></label><input type="range" id="humHigh" min="0" max="100" step="1"></div>
+      </div>
+      <div class="grp">
+        <h4>Soil and rain</h4>
+        <div class="row"><label>Soil alert below <em class="u-pct" id="vSoilAlert">30</em></label><input type="range" id="soilAlert" min="0" max="100" step="1"></div>
+        <div class="row"><label>Rain sensor trips below <em id="vRainThr">2000</em></label><input type="range" id="rainThr" min="0" max="4095" step="50"></div>
+        <div class="btns">
+          <button onclick="calibrate('dry')">Set current soil as dry</button>
+          <button onclick="calibrate('wet')">Set current soil as wet</button>
+        </div>
+        <div class="hint">Calibrate with the probe in dry air for dry, and in water for wet.</div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<footer>Tap or hover a chart to see exact values. The shaded band is the safe range, dashed lines are your limits, and red dots are readings outside the range.</footer>
+<div id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const FONT = "system-ui,-apple-system,'Segoe UI',Roboto,Arial,sans-serif";
+
+const COL = {
+  red:"#f06a5f", amber:"#e9b44c", blue:"#62b6e8",
+  temp:"#f4a259", hum:"#62b6e8", soil:"#8ccf7e",
+  line:"#27353a", text:"#e7eeef", muted:"#92a3a8", bg:"#151e21", band:"rgba(82,197,138,.14)"
+};
+
+let cfg = null, nextAt = 0;
+let IV = 10, REFRESH = 20, refreshTimer = null;
+
+/* ---------- THEME ---------- */
+function readTheme() {
+  const cs = getComputedStyle(document.documentElement);
+  const g = n => cs.getPropertyValue(n).trim();
+  COL.line = g("--line"); COL.text = g("--text"); COL.muted = g("--muted"); COL.bg = g("--surface");
+  COL.red = g("--bad"); COL.amber = g("--warn"); COL.blue = g("--cold");
+  COL.temp = g("--temp"); COL.hum = g("--hum"); COL.soil = g("--soilc");
+  COL.band = g("--safe-band");
+  if (charts.tempChart) {
+    charts.tempChart.o.color = COL.temp;
+    charts.humChart.o.color  = COL.hum;
+    charts.soilChart.o.color = COL.soil;
+  }
+}
+function redrawAll() {
+  updateCfgLines();
+  Object.keys(charts).forEach(drawChart);
+}
+function applyTheme(t) {
+  document.documentElement.setAttribute("data-theme", t);
+  $("themeBtn").innerText = (t === "dark") ? "\u2600\uFE0F Light" : "\uD83C\uDF19 Dark";
+  document.querySelector('meta[name="theme-color"]').setAttribute("content", t === "dark" ? "#0e1517" : "#f2f5f3");
+  readTheme(); redrawAll();
+}
+function toggleTheme() {
+  const t = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+  try { localStorage.setItem("agriTheme", t); } catch (e) {}
+  applyTheme(t);
+}
+
+/* ---------- METER (value marker on a safe-range bar) ---------- */
+function setMeter(p, value, min, max, lo, hi, state) {
+  const pct = v => Math.max(0, Math.min(100, (v - min)/(max - min)*100));
+  const s = $(p + "Safe"), m = $(p + "Mark");
+  s.style.left = pct(lo) + "%";
+  s.style.width = Math.max(0, pct(hi) - pct(lo)) + "%";
+  m.style.left = pct(value) + "%";
+  m.className = "mark " + state;
+}
+
+/* ---------- CHARTS ---------- */
+const charts = {};
+
+function agoText(samples) {
+  const s = samples * IV;
+  if (s === 0) return "now";
+  if (s >= 60) return "-" + (Math.round(s/6)/10) + "m";
+  return "-" + s + "s";
+}
+
+function drawChart(id) {
+  const s = charts[id]; if (!s) return;
+  const cv = $(id), ctx = cv.getContext("2d");
+  const o = s.o, v = s.v, n = v.length;
+
+  const w = cv.clientWidth, h = 220, dpr = window.devicePixelRatio || 1;
+  cv.width = w * dpr; cv.height = h * dpr;
+  ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,w,h);
+
+  const L = 34, R = 10, T = 12, B = 26;
+  const cw = w - L - R, ch = h - T - B;
+  const X = i => L + (n < 2 ? cw/2 : i*cw/(n-1));
+  const Y = val => T + ch - (Math.max(o.min, Math.min(o.max, val)) - o.min)/(o.max - o.min)*ch;
+  s.geo = { L:L, cw:cw };
+
+  // safe-range band
+  if (o.band) {
+    const y1 = Y(o.band[1]), y2 = Y(o.band[0]);
+    ctx.fillStyle = COL.band;
+    ctx.fillRect(L, y1, cw, Math.max(0, y2 - y1));
+  }
+
+  // grid + y labels
+  ctx.font = "11px " + FONT; ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = T + ch*i/4;
+    ctx.strokeStyle = COL.line;
+    ctx.beginPath(); ctx.moveTo(L,y); ctx.lineTo(w-R,y); ctx.stroke();
+    ctx.fillStyle = COL.muted; ctx.textAlign = "right";
+    ctx.fillText(Math.round(o.min + (o.max - o.min)*(4-i)/4), L - 6, y + 4);
+  }
+
+  // x labels
+  ctx.textAlign = "center"; ctx.fillStyle = COL.muted;
+  if (n >= 2) {
+    [0,0.25,0.5,0.75,1].forEach(f => {
+      ctx.fillText(agoText(Math.round((n-1)*(1-f))), L + cw*f, h - 8);
+    });
+  } else ctx.fillText("now", L + cw/2, h - 8);
+
+  // limit lines
+  (o.lines || []).forEach(t => {
+    if (t.v === undefined || t.v === null) return;
+    const y = Y(t.v);
+    ctx.setLineDash([5,5]); ctx.strokeStyle = t.c; ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(L,y); ctx.lineTo(w-R,y); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = t.c; ctx.textAlign = "right";
+    ctx.fillText(t.l, w - R - 4, y - 4);
+  });
+
+  if (n === 0) {
+    ctx.fillStyle = COL.muted; ctx.textAlign = "center"; ctx.font = "13px " + FONT;
+    ctx.fillText("Waiting for data...", w/2, h/2);
+    return;
+  }
+
+  // smooth path
+  function path() {
+    ctx.beginPath();
+    ctx.moveTo(X(0), Y(v[0]));
+    for (let i = 1; i < n; i++) {
+      const xm = (X(i-1) + X(i))/2, ym = (Y(v[i-1]) + Y(v[i]))/2;
+      ctx.quadraticCurveTo(X(i-1), Y(v[i-1]), xm, ym);
+    }
+    ctx.lineTo(X(n-1), Y(v[n-1]));
+  }
+
+  // area
+  const grad = ctx.createLinearGradient(0, T, 0, T + ch);
+  grad.addColorStop(0, o.color + "40"); grad.addColorStop(1, o.color + "05");
+  path(); ctx.lineTo(X(n-1), T+ch); ctx.lineTo(X(0), T+ch); ctx.closePath();
+  ctx.fillStyle = grad; ctx.fill();
+
+  // line
+  path();
+  ctx.strokeStyle = o.color; ctx.lineWidth = 2.2; ctx.lineJoin = "round"; ctx.lineCap = "round";
+  ctx.stroke();
+
+  // min / max markers
+  if (n > 2) {
+    let iMin = 0, iMax = 0;
+    v.forEach((x,i) => { if (x < v[iMin]) iMin = i; if (x > v[iMax]) iMax = i; });
+    [iMin, iMax].forEach(k => {
+      ctx.fillStyle = COL.bg; ctx.strokeStyle = o.color; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(X(k), Y(v[k]), 3.5, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+    });
+  }
+
+  // out-of-range dots
+  if (o.band) {
+    ctx.fillStyle = COL.red;
+    v.forEach((x,i) => {
+      if (x < o.band[0] || x > o.band[1]) {
+        ctx.beginPath(); ctx.arc(X(i), Y(x), 2.6, 0, Math.PI*2); ctx.fill();
+      }
+    });
+  }
+
+  // latest point
+  const last = v[n-1];
+  const bad = o.band && (last < o.band[0] || last > o.band[1]);
+  ctx.fillStyle = bad ? COL.red : o.color;
+  ctx.beginPath(); ctx.arc(X(n-1), Y(last), 4.5, 0, Math.PI*2); ctx.fill();
+  ctx.strokeStyle = COL.bg; ctx.lineWidth = 2; ctx.stroke();
+
+  // hover
+  if (s.h !== null && s.h !== undefined && s.h < n) {
+    const i = s.h, x = X(i), y = Y(v[i]);
+    ctx.strokeStyle = COL.muted; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x,T); ctx.lineTo(x,T+ch); ctx.stroke();
+    ctx.fillStyle = COL.text;
+    ctx.beginPath(); ctx.arc(x,y,4.5,0,Math.PI*2); ctx.fill();
+
+    const ago = n - 1 - i;
+    const t1 = ago === 0 ? "Latest" : (ago*IV >= 60 ? (Math.round(ago*IV/6)/10) + " min ago" : (ago*IV) + " s ago");
+    const t2 = v[i] + " " + (o.unit || "");
+
+    ctx.font = "600 12px " + FONT;
+    const tw = Math.max(ctx.measureText(t1).width, ctx.measureText(t2).width) + 20;
+    let bx = x + 12; if (bx + tw > w - 4) bx = x - 12 - tw;
+    const by = Math.max(T, Math.min(y - 20, T + ch - 44));
+
+    ctx.fillStyle = COL.bg; ctx.strokeStyle = COL.line; ctx.lineWidth = 1;
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(bx,by,tw,40,8); else ctx.rect(bx,by,tw,40);
+    ctx.fill(); ctx.stroke();
+
+    ctx.fillStyle = COL.muted; ctx.textAlign = "left"; ctx.font = "11px " + FONT;
+    ctx.fillText(t1, bx + 10, by + 15);
+    ctx.fillStyle = COL.text; ctx.font = "600 13px " + FONT;
+    ctx.fillText(t2, bx + 10, by + 31);
+  }
+}
+
+function setupChart(id, opts) {
+  charts[id] = { v:[], o:opts, h:null, geo:{ L:34, cw:100 } };
+  const cv = $(id);
+
+  function move(clientX) {
+    const s = charts[id], n = s.v.length;
+    if (n === 0) return;
+    const r = cv.getBoundingClientRect();
+    const x = clientX - r.left;
+    const i = n < 2 ? 0 : Math.round((x - s.geo.L)/s.geo.cw*(n-1));
+    s.h = Math.max(0, Math.min(n-1, i));
+    drawChart(id);
+  }
+  function leave() { charts[id].h = null; drawChart(id); }
+
+  cv.addEventListener("mousemove", e => move(e.clientX));
+  cv.addEventListener("mouseleave", leave);
+  cv.addEventListener("touchstart", e => move(e.touches[0].clientX), { passive:true });
+  cv.addEventListener("touchmove",  e => move(e.touches[0].clientX), { passive:true });
+  cv.addEventListener("touchend", leave);
+}
+
+function updateChart(id, vals) { charts[id].v = vals; drawChart(id); }
+
+function showStats(id, vals, unit, dec) {
+  const el = $(id);
+  if (!vals.length) { el.innerHTML = ""; return; }
+  const mn = Math.min.apply(null, vals), mx = Math.max.apply(null, vals);
+  const av = vals.reduce((a,b) => a + b, 0)/vals.length;
+  const box = (l,x) => '<div class="stat"><small>' + l + '</small><b>' + x.toFixed(dec) + unit + '</b></div>';
+  el.innerHTML = box("Min",mn) + box("Avg",av) + box("Max",mx) + box("Now",vals[vals.length-1]);
+}
+
+function updateCfgLines() {
+  if (!cfg) return;
+  charts.tempChart.o.lines = [
+    { v:cfg.tempHigh, c:COL.red,  l:"Hot " + cfg.tempHigh },
+    { v:cfg.tempLow,  c:COL.blue, l:"Cold " + cfg.tempLow }
+  ];
+  charts.tempChart.o.band = [cfg.tempLow, cfg.tempHigh];
+
+  charts.humChart.o.lines = [
+    { v:cfg.humHigh, c:COL.red,   l:"High " + cfg.humHigh },
+    { v:cfg.humLow,  c:COL.amber, l:"Low " + cfg.humLow }
+  ];
+  charts.humChart.o.band = [cfg.humLow, cfg.humHigh];
+
+  charts.soilChart.o.lines = [{ v:cfg.soilAlert, c:COL.red, l:"Alert " + cfg.soilAlert }];
+  charts.soilChart.o.band = [cfg.soilAlert, 100];
+}
+
+/* ---------- LAST MINUTE TABLE ---------- */
+function renderRecent(rec) {
+  const per = Math.max(1, Math.round(60/IV));
+  const last = rec.slice(-per).reverse();
+  $("recentInfo").innerText = "Last " + last.length + " readings, one every " + IV + " seconds";
+  let html = "";
+  last.forEach((x,k) => {
+    const ago = k === 0 ? "Latest" : (k*IV) + " s ago";
+    html += "<tr><td>" + ago + "</td><td>" + x.temp.toFixed(1) + " &deg;C</td><td>" + x.hum.toFixed(0) +
+      " %</td><td>" + x.soil + " %</td><td class=\"" + (x.rain ? "r-on" : "r-off") + "\">" +
+      (x.rain ? "Raining" : "No rain") + "</td></tr>";
+  });
+  $("recentBody").innerHTML = html;
+}
+
+/* ---------- HELPERS ---------- */
+function toast(msg) {
+  const t = $("toast"); t.innerText = msg; t.classList.add("show");
+  clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove("show"), 2200);
+}
+function chip(id, text, cls) { const e = $(id); e.innerText = text; e.className = "chip " + cls; }
+function fmtUp(s) {
+  const d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60);
+  return (d ? d + "d " : "") + h + "h " + m + "m";
+}
+
+/* ---------- SETTINGS ---------- */
+const SLIDERS = [
+  ["tempLow","vTempLow"], ["tempHigh","vTempHigh"],
+  ["humLow","vHumLow"], ["humHigh","vHumHigh"],
+  ["soilAlert","vSoilAlert"], ["rainThr","vRainThr"]
+];
+
+function initSliders() {
+  SLIDERS.forEach(p => {
+    const s = $(p[0]), v = $(p[1]);
+    s.addEventListener("input", () => { v.innerText = s.value; });
+    s.addEventListener("change", async () => {
+      try {
+        const r = await fetch("/set?" + p[0] + "=" + s.value);
+        if (!r.ok) throw 0;
+        toast("Saved");
+        updateDashboard();
+      } catch (e) { toast("Could not reach the ESP32"); }
+    });
+  });
+}
+function loadSliders(c) {
+  SLIDERS.forEach(p => {
+    const s = $(p[0]);
+    if (document.activeElement === s) return;
+    s.value = c[p[0]]; $(p[1]).innerText = c[p[0]];
+  });
+}
+async function calibrate(type) {
+  try {
+    const r = await fetch("/cal?type=" + type);
+    const j = await r.json();
+    if (j.ok) toast("Soil " + type + " point saved (sensor " + j.raw + ")");
+    else toast("Not saved (sensor " + j.raw + "). The dry value must be higher than the wet value.");
+    updateDashboard();
+  } catch (e) { toast("Could not reach the ESP32"); }
+}
+
+/* ---------- LED / BUZZER MODES ---------- */
+const MODE_NAMES = ["Auto", "On", "Off"];
+
+function initModes() {
+  [["ledSeg","led","LED"], ["buzSeg","buz","Buzzer"]].forEach(p => {
+    $(p[0]).querySelectorAll("button").forEach(b => {
+      b.addEventListener("click", async () => {
+        try {
+          const r = await fetch("/mode?" + p[1] + "=" + b.dataset.v);
+          if (!r.ok) throw 0;
+          toast(p[2] + " set to " + MODE_NAMES[+b.dataset.v]);
+          updateDashboard();
+        } catch (e) { toast("Could not reach the ESP32"); }
+      });
+    });
+  });
+}
+function showModes(c) {
+  [["ledSeg", c.ledMode], ["buzSeg", c.buzMode]].forEach(p => {
+    $(p[0]).querySelectorAll("button").forEach(b => {
+      const on = (+b.dataset.v === p[1]);
+      b.className = on ? ("active" + (p[1] === 2 ? " off" : "")) : "";
+    });
+  });
+}
+
+/* ---------- MAIN UPDATE ---------- */
+async function updateDashboard() {
+  try {
+    const ctl = new AbortController();
+    const tm = setTimeout(() => ctl.abort(), 8000);
+    const response = await fetch("/data", { signal:ctl.signal, cache:"no-store" });
+    clearTimeout(tm);
+    if (!response.ok) throw new Error("Server error");
+    const d = await response.json();
+
+    cfg = d.cfg;
+    IV = d.interval || 10;
+
+    if ((d.refresh && d.refresh !== REFRESH) || !refreshTimer) {
+      REFRESH = d.refresh || 20;
+      clearInterval(refreshTimer);
+      refreshTimer = setInterval(updateDashboard, REFRESH * 1000);
+    }
+
+    loadSliders(cfg);
+    showModes(cfg);
+    updateCfgLines();
+    nextAt = Date.now() + d.next * 1000;
+
+    // Temperature
+    let tCls, tTxt;
+    if (d.dhtError) { tTxt = "Check DHT11"; tCls = "bad"; }
+    else if (d.temperature < cfg.tempLow) { tTxt = "Too cold"; tCls = "cold"; }
+    else if (d.temperature > cfg.tempHigh) { tTxt = "Too hot"; tCls = "bad"; }
+    else { tTxt = "Normal"; tCls = "ok"; }
+    chip("tempStatus", tTxt, tCls);
+    $("tempVal").innerText = d.dhtError ? "--" : d.temperature.toFixed(1);
+    setMeter("temp", d.temperature, 0, 50, cfg.tempLow, cfg.tempHigh, tCls);
+    $("tempNote").innerText = "Safe range " + cfg.tempLow + " to " + cfg.tempHigh + " \u00B0C";
+
+    // Humidity
+    let hCls, hTxt;
+    if (d.dhtError) { hTxt = "Check DHT11"; hCls = "bad"; }
+    else if (d.humidity < cfg.humLow) { hTxt = "Too dry"; hCls = "warn"; }
+    else if (d.humidity > cfg.humHigh) { hTxt = "Too humid"; hCls = "bad"; }
+    else { hTxt = "Normal"; hCls = "ok"; }
+    chip("humStatus", hTxt, hCls);
+    $("humVal").innerText = d.dhtError ? "--" : d.humidity.toFixed(0);
+    setMeter("hum", d.humidity, 0, 100, cfg.humLow, cfg.humHigh, hCls);
+    $("humNote").innerText = "Safe range " + cfg.humLow + " to " + cfg.humHigh + " %";
+
+    // Soil
+    let sCls, sTxt;
+    if (d.soil < cfg.soilAlert) { sTxt = "Needs water"; sCls = "bad"; }
+    else if (d.soil <= 70) { sTxt = "Good"; sCls = "ok"; }
+    else { sTxt = "Wet"; sCls = "cold"; }
+    chip("soilStatus", sTxt, sCls);
+    $("soilVal").innerText = d.soil;
+    setMeter("soil", d.soil, 0, 100, cfg.soilAlert, 100, sCls);
+    $("soilNote").innerText = "Alert below " + cfg.soilAlert + " %, sensor reads " + d.soilRaw;
+
+    // Rain (lower sensor value means wetter)
+    const wet = (4095 - d.rainRaw)/4095*100;
+    const trip = (4095 - cfg.rainThr)/4095*100;
+    $("rainText").innerText = d.rain ? "Raining" : "No rain";
+    chip("rainStatus", d.rain ? "Rain alert" : "Clear", d.rain ? "bad" : "ok");
+    setMeter("rain", wet, 0, 100, 0, trip, d.rain ? "bad" : "ok");
+    $("rainNote").innerText = "Sensor reads " + d.rainRaw + ", rain below " + cfg.rainThr;
+
+    // Banner
+    const b = $("banner");
+    const reasons = [];
+    if (d.rain) reasons.push("Rainfall detected");
+    if (d.soil < cfg.soilAlert) reasons.push("Soil moisture below " + cfg.soilAlert + "%");
+
+    const warns = [];
+    if (d.dhtError) warns.push("DHT11 sensor error, check the wiring");
+    else {
+      if (d.temperature < cfg.tempLow) warns.push("Temperature below " + cfg.tempLow + "\u00B0C");
+      if (d.temperature > cfg.tempHigh) warns.push("Temperature above " + cfg.tempHigh + "\u00B0C");
+      if (d.humidity < cfg.humLow) warns.push("Humidity below " + cfg.humLow + "%");
+      if (d.humidity > cfg.humHigh) warns.push("Humidity above " + cfg.humHigh + "%");
+    }
+
+    if (d.alert) {
+      b.className = "alert";
+      $("bIcon").innerText = "!"; $("bTitle").innerText = "Alert";
+      $("bText").innerText = reasons.concat(warns).join(", ");
+    } else if (warns.length) {
+      b.className = "warn";
+      $("bIcon").innerText = "!"; $("bTitle").innerText = "Warning";
+      $("bText").innerText = warns.join(", ");
+    } else {
+      b.className = "";
+      $("bIcon").innerText = "\u2713"; $("bTitle").innerText = "All conditions normal";
+      $("bText").innerText = "Soil, rain, temperature and humidity are within limits";
+    }
+
+    $("ledOut").innerText = d.led ? "LED on" : "LED off";
+    $("ledOut").className = "out" + (d.led ? " on" : "");
+    $("buzOut").innerText = d.buzzer ? "Buzzer on" : "Buzzer off";
+    $("buzOut").className = "out" + (d.buzzer ? " on" : "");
+
+    // Charts
+    const rec = d.history;
+    const temps = rec.map(x => x.temp), hums = rec.map(x => x.hum), soils = rec.map(x => x.soil);
+    updateChart("tempChart", temps);
+    updateChart("humChart", hums);
+    updateChart("soilChart", soils);
+    showStats("tempStats", temps, "\u00B0C", 1);
+    showStats("humStats", hums, "%", 1);
+    showStats("soilStats", soils, "%", 0);
+
+    renderRecent(rec);
+
+    // System strip
+    $("count").innerText = rec.length + " of 60";
+    $("time").innerText = new Date().toLocaleTimeString();
+    $("rssi").innerText = d.rssi + " dBm";
+    $("uptime").innerText = fmtUp(d.uptime);
+    $("ivText").innerText = "Every " + IV + " s";
+    $("rfText").innerText = "Every " + REFRESH + " s";
+
+    $("connection").innerText = "ESP32 connected";
+    $("dot").className = "dot on";
+  }
+  catch (e) {
+    $("connection").innerText = "ESP32 disconnected";
+    $("dot").className = "dot off";
+    $("bTitle").innerText = "Connection lost";
+    $("bText").innerText = "Trying again every " + REFRESH + " seconds";
+    $("bIcon").innerText = "!";
+    $("banner").className = "warn";
+  }
+}
+
+/* ---------- START ---------- */
+setupChart("tempChart", { min:0, max:50,  color:COL.temp, unit:"\u00B0C" });
+setupChart("humChart",  { min:0, max:100, color:COL.hum,  unit:"%" });
+setupChart("soilChart", { min:0, max:100, color:COL.soil, unit:"%" });
+
+let savedTheme = "dark";
+try { savedTheme = localStorage.getItem("agriTheme") || "dark"; } catch (e) {}
+applyTheme(savedTheme === "light" ? "light" : "dark");
+
+initSliders();
+initModes();
+updateDashboard();
+
+setInterval(() => {
+  if (!nextAt) return;
+  let s = Math.round((nextAt - Date.now())/1000);
+  if (s < 0) s = ((s % IV) + IV) % IV;
+  $("next").innerText = s + " s";
+}, 1000);
+
+window.addEventListener("resize", redrawAll);
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ========== SETUP ==========
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(RAIN_PIN, INPUT);
+  pinMode(SOIL_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(LED_PIN, LOW);
+
+  analogReadResolution(12);
+
+  loadSettings();
+  dht.begin();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);            // faster, more reliable web responses
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(ssid, password);
+
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("WiFi Connected!");
+  Serial.print("Website link: http://");
+  Serial.println(WiFi.localIP());
+
+  server.on("/", []() {
+    server.send_P(200, "text/html", webpage);
+  });
+  server.on("/data", sendData);
+  server.on("/set", handleSet);
+  server.on("/mode", handleMode);
+  server.on("/cal", handleCal);
+
+  server.begin();
+  Serial.println("Web Server Started!");
+
+  readSensors();
+  lastSample = millis();
+
+  // Telegram startup message
+  sendTelegram("Farm monitor online.\nDashboard: http://" + WiFi.localIP().toString());
+}
+
+// ========== MAIN LOOP ==========
+void loop() {
+
+  server.handleClient();
+
+  unsigned long now = millis();
+
+  // Reconnect WiFi if it drops
+  if (WiFi.status() != WL_CONNECTED && now - lastWifiTry > 10000) {
+    lastWifiTry = now;
+    WiFi.reconnect();
+  }
+
+  if (now - lastSample >= SAMPLE_INTERVAL) {
+    lastSample = now;
+    readSensors();
+  }
+
+  updateAlerts();
+}
