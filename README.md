@@ -120,8 +120,10 @@ It also provides automatic LED and buzzer alerts, adjustable thresholds, soil ca
 - The wiring must match the actual assembled circuit.
 
 ### Circuit Diagram
+<img width="1536" height="1024" alt="ESP32 Smart Agriculture Wiring Diagram" src="https://github.com/user-attachments/assets/1fe9b38e-8256-4967-8384-9edfb41723c5" />
 
-![ESP32 Smart Agriculture Wiring Diagram](docs/images/wiring-diagram.png)
+
+
 
 ## 💻 6. Technology Stack
 
@@ -160,8 +162,8 @@ Install **DHT sensor library by Adafruit** from the Arduino IDE Library Manager 
 ### Step 1: Clone the Repository
 
 ```bash
-git clone https://github.com/TEJA-100/YOUR_REPOSITORY_NAME.git
-cd YOUR_REPOSITORY_NAME
+git clone https://github.com/TEJA-100/ESP32-Smart-IOT-Farming-System.git
+cd https://github.com/TEJA-100/ESP32-Smart-IOT-Farming-System
 ```
 
 ### Step 2: Open Arduino IDE
@@ -215,18 +217,17 @@ A single-page monitoring interface.
 ### Screenshots
 
 **Main Dashboard**
-
-![Main Dashboard](docs/images/dashboard-main.png)
+<img width="1310" height="707" alt="Dashboard_1" src="https://github.com/user-attachments/assets/45400ddb-389d-4c47-b21d-83ef2e03491c" />
 
 **Last-Minute Table, Controls and Calibration**
 
-![Dashboard Controls](docs/images/dashboard-controls.png)
+
+<img width="1000" height="681" alt="Dashboard_2" src="https://github.com/user-attachments/assets/551ec825-f003-4857-9612-1c0b856baa7b" />
 
 ### 📲 Telegram Bot Output
+<img width="1170" height="737" alt="TelegramBot" src="https://github.com/user-attachments/assets/aceab276-fdd2-4458-9dd6-2d674ed1dd87" />
 
-![Telegram Bot](docs/images/telegram-bot.png)
 
-## 🔄 10. Working Process
 
 1. Sensors collect environmental and soil information.
 2. The ESP32 reads digital and analog sensor outputs.
