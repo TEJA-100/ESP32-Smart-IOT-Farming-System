@@ -22,7 +22,7 @@ HOW TO ADD THE VIDEO ON GITHUB:
    A bare link on its own line is shown as an inline video player.
 -->
 
-https://github.com/user-attachments/assets/REPLACE_WITH_YOUR_VIDEO_ID
+https://github.com/user-attachments/assets/27085e01-33fc-4499-b90b-df3d471a4661
 
 > If the video is large, upload it to YouTube and use a clickable thumbnail instead:
 >
