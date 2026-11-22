@@ -24,11 +24,7 @@ HOW TO ADD THE VIDEO ON GITHUB:
 
 https://github.com/user-attachments/assets/27085e01-33fc-4499-b90b-df3d471a4661
 
-> If the video is large, upload it to YouTube and use a clickable thumbnail instead:
->
-> [![Watch the demo](docs/images/dashboard-main.png)](https://youtu.be/YOUR_VIDEO_ID)
 
----
 
 ## 📌 1. Project Overview
 
@@ -94,7 +90,6 @@ It also provides automatic LED and buzzer alerts, adjustable thresholds, soil ca
 | LED | 1 | Visual alert |
 | Buzzer | 1 | Sound alert |
 | 220Ω Resistor | 1 | LED current limiting |
-| 100Ω Resistor | 1 | Buzzer current limiting |
 | Jumper Wires | As required | Connections |
 | USB Cable / 5V Supply | 1 | Power supply |
 | Breadboard | 1 | Prototyping |
@@ -114,7 +109,7 @@ It also provides automatic LED and buzzer alerts, adjustable thresholds, soil ca
 | Rain Sensor | GND | GND |
 | LED | Positive (via 220Ω) | GPIO 26 |
 | LED | Negative | GND |
-| Buzzer | Positive (via 100Ω) | GPIO 25 |
+| Buzzer | Positive  | GPIO 25 |
 | Buzzer | Negative | GND |
 
 **Important:**
@@ -327,23 +322,9 @@ Smart-Agriculture-Monitoring/
     │   ├── dashboard-main.png
     │   ├── dashboard-controls.png
     │   └── telegram-bot.png
-    └── video/
-        └── demo.mp4
+    └
 ```
 
-## 🗓️ 17. Project Development Timeline
-
-| Phase | Activity | Status |
-|---|---|---|
-| Phase 1 | Planning and component selection | ✅ Completed |
-| Phase 2 | ESP32 and sensor interfacing | ✅ Completed |
-| Phase 3 | Data collection and processing | ✅ Completed |
-| Phase 4 | Web server and JSON integration | ✅ Completed |
-| Phase 5 | Responsive dashboard | ✅ Completed |
-| Phase 6 | LED and buzzer alerts | ✅ Completed |
-| Phase 7 | Telegram integration | ✅ Completed |
-| Phase 8 | Testing and calibration | 🔄 Update after testing |
-| Phase 9 | Documentation and GitHub deployment | 🔄 In progress |
 
 ## 🔮 18. Future Enhancements
 
